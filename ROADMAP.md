@@ -288,3 +288,4 @@ The `SpendStorage` interface is intentionally simple. Adapter implementations fo
 - **Streaming payment verification** — verify spend incrementally as a stream of small payments
 - **XRPL NFT revocation in middleware** — on-chain revocation check (currently only HTTP endpoint)
 - **Rate limiting** — protect revocation endpoint calls from DDoS via merchant backends
+- **x402 dual-proof adapter** — accept both an x402 payment proof and an MPCP SBA in the same request; verify the x402 payment on-chain and the SBA policy chain via `verifyMpcp`. Gives merchants cryptographic payment finality (x402) plus human delegation proof (MPCP) with a single middleware call. Depends on `mpcp-wallet-sdk` PR9 (`attachSba: true`) on the agent side.
