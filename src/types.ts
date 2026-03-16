@@ -1,3 +1,7 @@
+import type { RevocationChecker } from "./revocation.js";
+
+export type { RevocationChecker } from "./revocation.js";
+
 export type VerificationResult =
   | { valid: true; grant: GrantInfo; amount: string; currency: string }
   | { valid: false; error: MpcpError };
@@ -37,4 +41,14 @@ export interface MpcpOptions {
   signingKeyId?: string;
   /** Override clock for testing (ms since epoch). */
   nowMs?: number;
+
+  // PR2 — revocation
+  /** Explicit revocation endpoint; overrides the grant's revocationEndpoint. */
+  revocationEndpoint?: string;
+  /** Revocation cache TTL in ms. Default: 60_000. */
+  revocationTtl?: number;
+  /** Skip revocation check entirely. Default: false. */
+  skipRevocationCheck?: boolean;
+  /** Provide a pre-configured RevocationChecker instance. */
+  revocationChecker?: RevocationChecker;
 }

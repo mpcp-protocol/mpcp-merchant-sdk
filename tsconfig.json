@@ -12,5 +12,5 @@
     "skipLibCheck": true
   },
   "include": ["src/**/*"],
-  "exclude": ["src/adapters/**/*", "src/cache.ts", "src/revocation.ts", "src/storage.ts"]
+  "exclude": ["src/adapters/**/*", "src/storage.ts"]
 }

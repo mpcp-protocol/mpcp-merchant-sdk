@@ -1,6 +1,7 @@
 import { verifySignedBudgetAuthorization } from "mpcp-service/sdk";
 import type { SignedBudgetAuthorization } from "mpcp-service/sdk";
 import type { GrantInfo, MpcpOptions, VerificationResult } from "./types.js";
+import { RevocationChecker } from "./revocation.js";
 
 type Decision = Parameters<typeof verifySignedBudgetAuthorization>[1]["decision"];
 
@@ -103,7 +104,27 @@ export async function verifyMpcp(
       };
     }
 
-    // 5. Return success
+    // 5. Revocation check
+    if (!options.skipRevocationCheck) {
+      const endpoint = options.revocationEndpoint;
+      if (endpoint) {
+        const checker =
+          options.revocationChecker ??
+          new RevocationChecker({ ttlMs: options.revocationTtl });
+        const revResult = await checker.check(endpoint, auth.grantId);
+        if (revResult.revoked) {
+          return {
+            valid: false,
+            error: {
+              code: "grant_revoked",
+              detail: revResult.revokedAt ? `Revoked at ${revResult.revokedAt}` : "Grant has been revoked",
+            },
+          };
+        }
+      }
+    }
+
+    // 6. Return success
     const grant: GrantInfo = {
       grantId: auth.grantId,
       policyHash: auth.policyHash,
