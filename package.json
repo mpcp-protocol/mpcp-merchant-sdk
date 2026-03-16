@@ -13,6 +13,10 @@
     "./express": {
       "types": "./dist/adapters/express.d.ts",
       "default": "./dist/adapters/express.js"
+    },
+    "./fastify": {
+      "types": "./dist/adapters/fastify.d.ts",
+      "default": "./dist/adapters/fastify.js"
     }
   },
   "scripts": {
@@ -21,12 +25,14 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "fastify-plugin": "^5.1.0",
     "mpcp-service": "file:../mpcp-reference"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^22.0.0",
     "express": "^5.1.0",
+    "fastify": "^5.8.2",
     "typescript": "^5.9.2",
     "vitest": "^4.0.18"
   }
