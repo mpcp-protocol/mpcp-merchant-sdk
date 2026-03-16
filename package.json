@@ -24,6 +24,12 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
+  "peerDependencies": {
+    "fastify": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "fastify": { "optional": true }
+  },
   "dependencies": {
     "fastify-plugin": "^5.1.0",
     "mpcp-service": "file:../mpcp-reference"

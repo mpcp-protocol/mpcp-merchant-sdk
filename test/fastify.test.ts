@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import Fastify from "fastify";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import Fastify, { type FastifyInstance } from "fastify";
 
 // Stub verifyMpcp before importing the plugin
 vi.mock("../src/verify.js", () => ({
@@ -44,8 +44,17 @@ async function buildApp(opts = pluginOpts) {
 }
 
 describe("fastifyMpcp plugin", () => {
+  // Track Fastify instances created inline (not via buildApp) so they can be
+  // closed after each test to prevent EventEmitter leak warnings.
+  const appsToClose: FastifyInstance[] = [];
+
   beforeEach(() => {
     vi.resetAllMocks();
+  });
+
+  afterEach(async () => {
+    await Promise.all(appsToClose.map((a) => a.close()));
+    appsToClose.length = 0;
   });
 
   it("SBA in Authorization header → handler called, request.mpcp set", async () => {
@@ -109,6 +118,7 @@ describe("fastifyMpcp plugin", () => {
     });
 
     const app = Fastify({ logger: false });
+    appsToClose.push(app);
     await app.register(fastifyMpcp, { ...pluginOpts, strict: false });
     app.post("/test", async (req) => req.mpcp);
     await app.ready();
@@ -160,6 +170,7 @@ describe("fastifyMpcp plugin", () => {
 
   it("getAmount throws → 402 with sba_invalid", async () => {
     const app = Fastify({ logger: false });
+    appsToClose.push(app);
     await app.register(fastifyMpcp, {
       ...pluginOpts,
       getAmount: () => { throw new Error("missing amount param"); },
@@ -179,6 +190,7 @@ describe("fastifyMpcp plugin", () => {
 
   it("getCurrency throws → 402 with sba_invalid", async () => {
     const app = Fastify({ logger: false });
+    appsToClose.push(app);
     await app.register(fastifyMpcp, {
       ...pluginOpts,
       getCurrency: () => { throw new Error("missing currency param"); },
@@ -200,6 +212,7 @@ describe("fastifyMpcp plugin", () => {
     mockVerify.mockResolvedValue({ valid: true, grant: FAKE_GRANT, amount: "1000", currency: "USD" });
 
     const app = Fastify({ logger: false });
+    appsToClose.push(app);
     await app.register(fastifyMpcp, pluginOpts);
 
     // Route registered at the root level (outside plugin scope) can still access request.mpcp
@@ -214,5 +227,58 @@ describe("fastifyMpcp plugin", () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json().valid).toBe(true);
+  });
+
+  it("strict: false + no SBA → handler called with request.mpcp.valid === false", async () => {
+    const app = Fastify({ logger: false });
+    appsToClose.push(app);
+    await app.register(fastifyMpcp, { ...pluginOpts, strict: false });
+    app.post("/test", async (req) => req.mpcp);
+    await app.ready();
+
+    // No Authorization header, no body.sba
+    const res = await app.inject({ method: "POST", url: "/test" });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.valid).toBe(false);
+    expect(body.error.code).toBe("sba_invalid");
+  });
+
+  it("strict: false + getAmount throws → handler called with request.mpcp.valid === false", async () => {
+    const app = Fastify({ logger: false });
+    appsToClose.push(app);
+    await app.register(fastifyMpcp, {
+      ...pluginOpts,
+      strict: false,
+      getAmount: () => { throw new Error("amount missing"); },
+    });
+    app.post("/test", async (req) => req.mpcp);
+    await app.ready();
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/test",
+      headers: { authorization: `MPCP ${ENCODED_SBA}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.valid).toBe(false);
+    expect(body.error.code).toBe("sba_invalid");
+  });
+
+  it("verifyMpcp throws unexpectedly → 402 with sba_invalid (not a 500)", async () => {
+    mockVerify.mockRejectedValue(new Error("unexpected internal failure"));
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: "POST",
+      url: "/test",
+      headers: { authorization: `MPCP ${ENCODED_SBA}` },
+    });
+
+    expect(res.statusCode).toBe(402);
+    expect(res.json()).toMatchObject({ error: "sba_invalid", detail: "Verification error" });
   });
 });
