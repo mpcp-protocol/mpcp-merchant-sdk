@@ -2,6 +2,7 @@ import { verifySignedBudgetAuthorization } from "mpcp-service/sdk";
 import type { SignedBudgetAuthorization } from "mpcp-service/sdk";
 import type { GrantInfo, MpcpOptions, VerificationResult } from "./types.js";
 import { RevocationChecker } from "./revocation.js";
+import { MemorySpendStorage } from "./adapters/memory.js";
 
 type Decision = Parameters<typeof verifySignedBudgetAuthorization>[1]["decision"];
 
@@ -68,13 +69,21 @@ export async function verifyMpcp(
       process.env.MPCP_SBA_SIGNING_KEY_ID = options.signingKeyId;
     }
 
-    // 3. Verify signature, expiry, amount bounds via mpcp-reference
+    // 3. Cumulative spend from storage (or "0" if not tracking)
+    const storage = options.trackSpend
+      ? (options.spendStorage ?? new MemorySpendStorage())
+      : null;
+    const cumulativeSpentMinor = storage
+      ? await storage.total(auth.grantId, auth.currency)
+      : "0";
+
+    // 4. Verify signature, expiry, amount bounds via mpcp-reference
     const decision = syntheticDecision(sba, options.amount);
     const result = verifySignedBudgetAuthorization(sba, {
       sessionId: auth.sessionId,
       decision,
       nowMs: options.nowMs,
-      cumulativeSpentMinor: "0",
+      cumulativeSpentMinor,
     });
 
     if (!result.ok) {
@@ -92,7 +101,7 @@ export async function verifyMpcp(
       }
     }
 
-    // 4. Destination check
+    // 5. Destination check
     if (
       options.merchantId !== undefined &&
       auth.destinationAllowlist.length > 0 &&
@@ -104,7 +113,7 @@ export async function verifyMpcp(
       };
     }
 
-    // 5. Revocation check
+    // 6. Revocation check
     if (!options.skipRevocationCheck) {
       const endpoint = options.revocationEndpoint;
       if (endpoint) {
@@ -124,7 +133,18 @@ export async function verifyMpcp(
       }
     }
 
-    // 6. Return success
+    // 7. Record spend (idempotency-safe)
+    if (storage) {
+      await storage.record({
+        grantId: auth.grantId,
+        idempotencyKey: options.idempotencyKey,
+        amount: options.amount,
+        currency: auth.currency,
+        recordedAt: new Date().toISOString(),
+      });
+    }
+
+    // 8. Return success
     const grant: GrantInfo = {
       grantId: auth.grantId,
       policyHash: auth.policyHash,

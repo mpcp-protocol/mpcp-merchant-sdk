@@ -1,6 +1,8 @@
 import type { RevocationChecker } from "./revocation.js";
+import type { SpendStorage } from "./storage.js";
 
 export type { RevocationChecker } from "./revocation.js";
+export type { SpendStorage, SpendEntry } from "./storage.js";
 
 export type VerificationResult =
   | { valid: true; grant: GrantInfo; amount: string; currency: string }
@@ -51,4 +53,12 @@ export interface MpcpOptions {
   skipRevocationCheck?: boolean;
   /** Provide a pre-configured RevocationChecker instance. */
   revocationChecker?: RevocationChecker;
+
+  // PR3 — spend tracking
+  /** Enable cumulative spend tracking against the grant ceiling. Default: false. */
+  trackSpend?: boolean;
+  /** Pluggable spend storage. Defaults to MemorySpendStorage when trackSpend is true. */
+  spendStorage?: SpendStorage;
+  /** Idempotency key for deduplication. Same key is never counted twice. */
+  idempotencyKey?: string;
 }
