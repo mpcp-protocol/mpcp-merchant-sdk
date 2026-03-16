@@ -9,7 +9,12 @@
     "sourceMap": true,
     "outDir": "./dist",
     "esModuleInterop": false,
+    // Required for `import fp from "fastify-plugin"` — fastify-plugin uses
+    // `export = fastifyPlugin` (CJS-style). allowSyntheticDefaultImports permits
+    // the default import syntax without adding runtime interop helpers (esModuleInterop).
+    "allowSyntheticDefaultImports": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*"],
+  // Include test files so `npm run check` catches type errors in tests too.
+  "include": ["src/**/*", "test/**/*"],
 }

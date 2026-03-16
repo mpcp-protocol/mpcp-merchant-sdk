@@ -9,6 +9,14 @@ export type { SpendStorage, SpendEntry } from "./storage.js";
 /** Mirrors mpcp-reference's BudgetScope union. */
 export type BudgetScope = "SESSION" | "DAY" | "VEHICLE" | "FLEET" | "TRIP";
 
+/**
+ * Attached to every request processed by an MPCP adapter (Express or Fastify).
+ * Discriminated on `valid` for type-safe handler code.
+ */
+export type MpcpContext =
+  | { valid: true; grant: GrantInfo; amount: string; currency: string }
+  | { valid: false; error: MpcpError };
+
 export type VerificationResult =
   | { valid: true; grant: GrantInfo; amount: string; currency: string }
   | { valid: false; error: MpcpError };

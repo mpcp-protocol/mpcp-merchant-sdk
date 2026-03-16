@@ -2,19 +2,16 @@ import type { Request, Response, NextFunction, RequestHandler } from "express";
 import { verifyMpcp } from "../verify.js";
 import { RevocationChecker } from "../revocation.js";
 import { MemorySpendStorage } from "./memory.js";
-import type { GrantInfo, MpcpError, MpcpOptions } from "../types.js";
+import type { MpcpContext, MpcpOptions } from "../types.js";
 import type { SpendStorage } from "../storage.js";
 
-/** Maximum allowed byte length for the base64 SBA payload in the Authorization header. */
-const MAX_SBA_HEADER_BYTES = 8192;
+export type { MpcpContext } from "../types.js";
 
-export interface MpcpContext {
-  valid: boolean;
-  grant?: GrantInfo;
-  amount?: string;
-  currency?: string;
-  error?: MpcpError;
-}
+/**
+ * Base64 character limit for the Authorization header SBA payload.
+ * Base64 encodes 3 bytes as 4 chars, so this allows ~6 KB of decoded JSON.
+ */
+const MAX_SBA_HEADER_BASE64_CHARS = 8192;
 
 // Extend Express Request type
 declare global {
@@ -38,23 +35,26 @@ export interface MpcpMiddlewareOptions extends Omit<MpcpOptions, "amount" | "cur
  * Factory that returns an Express middleware for MPCP verification.
  *
  * Extracts the SBA from:
- *   1. `Authorization: MPCP <base64-encoded-json>` header (max 8 KB)
+ *   1. `Authorization: MPCP <base64-encoded-json>` header (max ~6 KB decoded)
  *   2. `req.body.sba` fallback
  *
  * On valid: attaches req.mpcp and calls next().
  * On invalid (strict mode, default): responds 402 with structured error body.
  */
 export function mpcp(options: MpcpMiddlewareOptions): RequestHandler {
-  // Create shared instances once per factory call, not per request.
-  const sharedChecker = options.skipRevocationCheck
-    ? undefined
-    : (options.revocationChecker ?? new RevocationChecker({ ttlMs: options.revocationTtl }));
+  // Destructure adapter-only fields so they are never forwarded to verifyMpcp.
+  const { getAmount, getCurrency, strict: strictOpt, ...mpcpOptions } = options;
 
-  const sharedStorage: SpendStorage | undefined = options.trackSpend
-    ? (options.spendStorage ?? new MemorySpendStorage())
+  // Create shared instances once per factory call, not per request.
+  const sharedChecker = mpcpOptions.skipRevocationCheck
+    ? undefined
+    : (mpcpOptions.revocationChecker ?? new RevocationChecker({ ttlMs: mpcpOptions.revocationTtl }));
+
+  const sharedStorage: SpendStorage | undefined = mpcpOptions.trackSpend
+    ? (mpcpOptions.spendStorage ?? new MemorySpendStorage())
     : undefined;
 
-  const strict = options.strict !== false;
+  const strict = strictOpt !== false;
 
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     // Extract SBA
@@ -63,7 +63,7 @@ export function mpcp(options: MpcpMiddlewareOptions): RequestHandler {
     const authHeader = req.headers["authorization"];
     if (authHeader && authHeader.startsWith("MPCP ")) {
       const encoded = authHeader.slice(5).trim();
-      if (encoded.length <= MAX_SBA_HEADER_BYTES) {
+      if (encoded.length <= MAX_SBA_HEADER_BASE64_CHARS) {
         try {
           sba = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
         } catch {
@@ -83,7 +83,7 @@ export function mpcp(options: MpcpMiddlewareOptions): RequestHandler {
       };
       req.mpcp = context;
       if (strict) {
-        res.status(402).json({ error: context.error?.code, detail: context.error?.detail });
+        res.status(402).json({ error: context.error.code, detail: context.error.detail });
         return;
       }
       next();
@@ -93,8 +93,8 @@ export function mpcp(options: MpcpMiddlewareOptions): RequestHandler {
     let amount: string;
     let currency: string;
     try {
-      amount = options.getAmount(req);
-      currency = options.getCurrency(req);
+      amount = getAmount(req);
+      currency = getCurrency(req);
     } catch (err) {
       const detail = err instanceof Error ? err.message : "Failed to extract amount or currency from request";
       const context: MpcpContext = { valid: false, error: { code: "sba_invalid", detail } };
@@ -108,7 +108,7 @@ export function mpcp(options: MpcpMiddlewareOptions): RequestHandler {
     }
 
     const result = await verifyMpcp(sba, {
-      ...options,
+      ...mpcpOptions,
       amount,
       currency,
       revocationChecker: sharedChecker,
