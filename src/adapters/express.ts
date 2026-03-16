@@ -5,6 +5,9 @@ import { MemorySpendStorage } from "./memory.js";
 import type { GrantInfo, MpcpError, MpcpOptions } from "../types.js";
 import type { SpendStorage } from "../storage.js";
 
+/** Maximum allowed byte length for the base64 SBA payload in the Authorization header. */
+const MAX_SBA_HEADER_BYTES = 8192;
+
 export interface MpcpContext {
   valid: boolean;
   grant?: GrantInfo;
@@ -35,14 +38,18 @@ export interface MpcpMiddlewareOptions extends Omit<MpcpOptions, "amount" | "cur
  * Factory that returns an Express middleware for MPCP verification.
  *
  * Extracts the SBA from:
- *   1. `Authorization: MPCP <base64-encoded-json>` header
+ *   1. `Authorization: MPCP <base64-encoded-json>` header (max 8 KB)
  *   2. `req.body.sba` fallback
  *
  * On valid: attaches req.mpcp and calls next().
- * On invalid (strict mode): responds 402 with structured error body.
+ * On invalid (strict mode, default): responds 402 with structured error body.
  */
 export function mpcp(options: MpcpMiddlewareOptions): RequestHandler {
-  const sharedChecker = options.revocationChecker ?? new RevocationChecker({ ttlMs: options.revocationTtl });
+  // Create shared instances once per factory call, not per request.
+  const sharedChecker = options.skipRevocationCheck
+    ? undefined
+    : (options.revocationChecker ?? new RevocationChecker({ ttlMs: options.revocationTtl }));
+
   const sharedStorage: SpendStorage | undefined = options.trackSpend
     ? (options.spendStorage ?? new MemorySpendStorage())
     : undefined;
@@ -56,10 +63,12 @@ export function mpcp(options: MpcpMiddlewareOptions): RequestHandler {
     const authHeader = req.headers["authorization"];
     if (authHeader && authHeader.startsWith("MPCP ")) {
       const encoded = authHeader.slice(5).trim();
-      try {
-        sba = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
-      } catch {
-        // fall through to body fallback
+      if (encoded.length <= MAX_SBA_HEADER_BYTES) {
+        try {
+          sba = JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
+        } catch {
+          // fall through to body fallback
+        }
       }
     }
 
@@ -81,8 +90,22 @@ export function mpcp(options: MpcpMiddlewareOptions): RequestHandler {
       return;
     }
 
-    const amount = options.getAmount(req);
-    const currency = options.getCurrency(req);
+    let amount: string;
+    let currency: string;
+    try {
+      amount = options.getAmount(req);
+      currency = options.getCurrency(req);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "Failed to extract amount or currency from request";
+      const context: MpcpContext = { valid: false, error: { code: "sba_invalid", detail } };
+      req.mpcp = context;
+      if (strict) {
+        res.status(402).json({ error: "sba_invalid", detail });
+        return;
+      }
+      next();
+      return;
+    }
 
     const result = await verifyMpcp(sba, {
       ...options,

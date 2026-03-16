@@ -147,4 +147,53 @@ describe("mpcp() Express middleware", () => {
 
     expect(next).toHaveBeenCalledOnce();
   });
+
+  it("Authorization header payload exceeding size limit → falls back to body", async () => {
+    mockVerify.mockResolvedValue({ valid: true, grant: FAKE_GRANT, amount: "1000", currency: "USD" });
+
+    const oversized = Buffer.alloc(9000, "x").toString("base64");
+    const middleware = mpcp(middlewareOpts);
+    const req = makeReq({
+      headers: { authorization: `MPCP ${oversized}` },
+      body: { sba: VALID_SBA_OBJ },
+    });
+    const { res } = makeRes();
+    const next = vi.fn() as unknown as NextFunction;
+
+    await middleware(req, res, next);
+
+    expect(next).toHaveBeenCalledOnce();
+  });
+
+  it("getAmount throws → 402 with sba_invalid", async () => {
+    const middleware = mpcp({
+      ...middlewareOpts,
+      getAmount: () => { throw new Error("missing amount param"); },
+    });
+    const req = makeReq({ headers: { authorization: `MPCP ${ENCODED_SBA}` } });
+    const { res, status, json } = makeRes();
+    const next = vi.fn() as unknown as NextFunction;
+
+    await middleware(req, res, next);
+
+    expect(status).toHaveBeenCalledWith(402);
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ error: "sba_invalid" }));
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("getCurrency throws → 402 with sba_invalid", async () => {
+    const middleware = mpcp({
+      ...middlewareOpts,
+      getCurrency: () => { throw new Error("missing currency param"); },
+    });
+    const req = makeReq({ headers: { authorization: `MPCP ${ENCODED_SBA}` } });
+    const { res, status, json } = makeRes();
+    const next = vi.fn() as unknown as NextFunction;
+
+    await middleware(req, res, next);
+
+    expect(status).toHaveBeenCalledWith(402);
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ error: "sba_invalid" }));
+    expect(next).not.toHaveBeenCalled();
+  });
 });

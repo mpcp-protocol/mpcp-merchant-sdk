@@ -9,6 +9,7 @@ const PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }) as s
 const PUBLIC_KEY_PEM = publicKey.export({ type: "spki", format: "pem" }) as string;
 const KEY_ID = "test-key-rev";
 const REVOCATION_ENDPOINT = "https://example.com/revoke";
+const REVOCATION_ENDPOINT_B = "https://other.example.com/revoke";
 const FUTURE = new Date(Date.now() + 3_600_000).toISOString();
 
 function makeSba(grantId = "grant-rev-001") {
@@ -53,6 +54,20 @@ describe("verifyMpcp — revocation", () => {
     const result = await verifyMpcp(sba, baseOptions);
     expect(result.valid).toBe(false);
     if (!result.valid) expect(result.error.code).toBe("grant_revoked");
+  });
+
+  it("non-ISO revokedAt is not interpolated into error detail", async () => {
+    vi.stubGlobal("fetch", async () => ({
+      ok: true,
+      json: async () => ({ revoked: true, revokedAt: "<script>alert(1)</script>" }),
+    }));
+    const sba = makeSba();
+    const result = await verifyMpcp(sba, baseOptions);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.error.detail).not.toContain("<script>");
+      expect(result.error.detail).toBe("Grant has been revoked");
+    }
   });
 
   it("not revoked → valid: true", async () => {
@@ -113,5 +128,22 @@ describe("verifyMpcp — revocation", () => {
     const sba = makeSba();
     const result = await verifyMpcp(sba, baseOptions);
     expect(result.valid).toBe(true);
+  });
+
+  it("same grantId on different endpoints → separate cache entries", async () => {
+    const fetchSpy = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ revoked: false }),
+    }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const checker = new RevocationChecker({ ttlMs: 60_000 });
+    const sba = makeSba("grant-multi-endpoint");
+
+    await verifyMpcp(sba, { ...baseOptions, revocationEndpoint: REVOCATION_ENDPOINT, revocationChecker: checker });
+    await verifyMpcp(sba, { ...baseOptions, revocationEndpoint: REVOCATION_ENDPOINT_B, revocationChecker: checker });
+
+    // Different endpoints → two fetches, not one
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 });

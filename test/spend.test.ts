@@ -10,7 +10,7 @@ const PUBLIC_KEY_PEM = publicKey.export({ type: "spki", format: "pem" }) as stri
 const KEY_ID = "test-key-spend";
 const FUTURE = new Date(Date.now() + 3_600_000).toISOString();
 
-function makeSba(opts: { maxAmountMinor?: string; grantId?: string } = {}) {
+function makeSba(opts: { maxAmountMinor?: string; grantId?: string; currency?: string } = {}) {
   process.env.MPCP_SBA_SIGNING_PRIVATE_KEY_PEM = PRIVATE_KEY_PEM;
   process.env.MPCP_SBA_SIGNING_KEY_ID = KEY_ID;
   const sba = createSignedBudgetAuthorization({
@@ -18,7 +18,7 @@ function makeSba(opts: { maxAmountMinor?: string; grantId?: string } = {}) {
     actorId: "agent-spend",
     grantId: opts.grantId ?? "grant-spend-001",
     policyHash: "hash-spend",
-    currency: "USD",
+    currency: opts.currency ?? "USD",
     maxAmountMinor: opts.maxAmountMinor ?? "3000",
     allowedRails: ["stripe"],
     allowedAssets: [],
@@ -65,7 +65,7 @@ describe("verifyMpcp — spend tracking", () => {
     const result = await verifyMpcp(sba, { ...baseOpts, amount: "1000", spendStorage: storage });
     expect(result.valid).toBe(false);
     if (!result.valid) expect(result.error.code).toBe("amount_exceeded");
-    // Should not have recorded the failed payment
+    // Failed payment must not be recorded
     expect(await storage.total("grant-spend-001", "USD")).toBe("1000");
   });
 
@@ -98,5 +98,28 @@ describe("verifyMpcp — spend tracking", () => {
     const result = await verifyMpcp(sba, { ...baseOpts, amount: "500", spendStorage: storage });
     expect(result.valid).toBe(true);
     expect(await storage.total("grant-custom", "USD")).toBe("500");
+  });
+
+  it("spend for grant A does not affect grant B total", async () => {
+    const storage = new MemorySpendStorage();
+    const sbaA = makeSba({ grantId: "grant-A" });
+    await verifyMpcp(sbaA, { ...baseOpts, amount: "1000", spendStorage: storage });
+    expect(await storage.total("grant-B", "USD")).toBe("0");
+  });
+});
+
+describe("MemorySpendStorage", () => {
+  it("rejects non-integer amount in record()", async () => {
+    const storage = new MemorySpendStorage();
+    await expect(
+      storage.record({ grantId: "g", amount: "10.50", currency: "USD", recordedAt: new Date().toISOString() }),
+    ).rejects.toThrow(/non-negative integer/);
+  });
+
+  it("rejects empty amount string", async () => {
+    const storage = new MemorySpendStorage();
+    await expect(
+      storage.record({ grantId: "g", amount: "", currency: "USD", recordedAt: new Date().toISOString() }),
+    ).rejects.toThrow();
   });
 });
