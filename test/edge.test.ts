@@ -7,7 +7,8 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { createSignedBudgetAuthorization } from "mpcp-service/sdk";
+import { createSignedBudgetAuthorization, signTrustBundle } from "mpcp-service/sdk";
+import type { KeyWithKid, UnsignedTrustBundle } from "mpcp-service/sdk";
 import { verifyMpcpEdge } from "../src/adapters/edge.js";
 
 const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -24,9 +25,12 @@ function makeSba(overrides: {
   grantId?: string;
   currency?: string;
   allowedRails?: string[];
+  issuer?: string;
+  privateKeyPem?: string;
+  keyId?: string;
 } = {}) {
-  process.env.MPCP_SBA_SIGNING_PRIVATE_KEY_PEM = PRIVATE_KEY_PEM;
-  process.env.MPCP_SBA_SIGNING_KEY_ID = KEY_ID;
+  process.env.MPCP_SBA_SIGNING_PRIVATE_KEY_PEM = overrides.privateKeyPem ?? PRIVATE_KEY_PEM;
+  process.env.MPCP_SBA_SIGNING_KEY_ID = overrides.keyId ?? KEY_ID;
   try {
     return createSignedBudgetAuthorization({
       sessionId: "sess-edge",
@@ -39,6 +43,7 @@ function makeSba(overrides: {
       allowedAssets: [],
       destinationAllowlist: overrides.destinationAllowlist ?? [],
       expiresAt: overrides.expiresAt ?? FUTURE,
+      ...(overrides.issuer !== undefined ? { issuer: overrides.issuer } : {}),
     });
   } finally {
     delete process.env.MPCP_SBA_SIGNING_PRIVATE_KEY_PEM;
@@ -307,6 +312,102 @@ describe("verifyMpcpEdge — edge-case guards", () => {
       authorization: { ...(sba as any).authorization, _extraNull: null },
     };
     const result = await verifyMpcpEdge(makeHeaderRequest(tampered), baseOpts);
+    expect(result.valid).toBe(true);
+  });
+});
+
+describe("verifyMpcpEdge — trust bundles (PR9)", () => {
+  /** Generate a signed trust bundle containing a given issuer key JWK. */
+  function makeBundle(issuerDomain: string, issuerKeyJwk: KeyWithKid, opts: { expired?: boolean } = {}) {
+    const { privateKey: bPriv } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const bundleIssuerPrivPem = bPriv.export({ type: "pkcs8", format: "pem" }) as string;
+    const unsigned: UnsignedTrustBundle = {
+      version: "1.0",
+      bundleId: `bundle-${Math.random().toString(36).slice(2)}`,
+      bundleIssuer: "ba.example.com",
+      bundleKeyId: "ba-key-1",
+      category: "payment-policy",
+      approvedIssuers: [issuerDomain],
+      issuers: [{ issuer: issuerDomain, keys: [issuerKeyJwk] }],
+      expiresAt: opts.expired
+        ? new Date(Date.now() - 1000).toISOString()
+        : new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    return signTrustBundle(unsigned, bundleIssuerPrivPem);
+  }
+
+  it("verifies SBA with P-256 JWK in trust bundle — no signingKeyPem needed", async () => {
+    const sbaKeyJwk = { ...publicKey.export({ format: "jwk" }), kid: KEY_ID } as KeyWithKid;
+    const bundle = makeBundle("pa.example.com", sbaKeyJwk);
+    const sba = makeSba({ issuer: "pa.example.com" });
+
+    const result = await verifyMpcpEdge(makeHeaderRequest(sba), {
+      amount: "1000",
+      currency: "USD",
+      trustBundles: [bundle],
+      skipRevocationCheck: true,
+    });
+    expect(result.valid).toBe(true);
+    if (result.valid) expect(result.grant.grantId).toBe("grant-edge-001");
+  });
+
+  it("verifies SBA with Ed25519 JWK in trust bundle", async () => {
+    const { privateKey: edPriv, publicKey: edPub } = generateKeyPairSync("ed25519");
+    const edPrivPem = edPriv.export({ type: "pkcs8", format: "pem" }) as string;
+    const edPubJwk = { ...edPub.export({ format: "jwk" }), kid: "ed-key-tb" } as KeyWithKid;
+
+    const bundle = makeBundle("pa.example.com", edPubJwk);
+    const sba = makeSba({ issuer: "pa.example.com", privateKeyPem: edPrivPem, keyId: "ed-key-tb" });
+
+    const result = await verifyMpcpEdge(makeHeaderRequest(sba), {
+      amount: "1000",
+      currency: "USD",
+      trustBundles: [bundle],
+      skipRevocationCheck: true,
+    });
+    expect(result.valid).toBe(true);
+  });
+
+  it("no signingKeyPem and no trustBundles → sba_invalid", async () => {
+    const sba = makeSba();
+    const result = await verifyMpcpEdge(makeHeaderRequest(sba), {
+      amount: "1000",
+      currency: "USD",
+      skipRevocationCheck: true,
+    });
+    expect(result.valid).toBe(false);
+    if (!result.valid) expect(result.error.code).toBe("sba_invalid");
+  });
+
+  it("trust bundle with wrong key → sba_invalid", async () => {
+    const { publicKey: wrongPub } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const wrongKeyJwk = { ...wrongPub.export({ format: "jwk" }), kid: KEY_ID } as KeyWithKid;
+    const bundle = makeBundle("pa.example.com", wrongKeyJwk);
+    const sba = makeSba({ issuer: "pa.example.com" });
+
+    const result = await verifyMpcpEdge(makeHeaderRequest(sba), {
+      amount: "1000",
+      currency: "USD",
+      trustBundles: [bundle],
+      skipRevocationCheck: true,
+    });
+    expect(result.valid).toBe(false);
+    if (!result.valid) expect(result.error.code).toBe("sba_invalid");
+  });
+
+  it("expired bundle falls through to signingKeyPem → valid: true", async () => {
+    const sbaKeyJwk = { ...publicKey.export({ format: "jwk" }), kid: KEY_ID } as KeyWithKid;
+    const expiredBundle = makeBundle("pa.example.com", sbaKeyJwk, { expired: true });
+    const sba = makeSba({ issuer: "pa.example.com" });
+
+    const result = await verifyMpcpEdge(makeHeaderRequest(sba), {
+      amount: "1000",
+      currency: "USD",
+      signingKeyPem: PUBLIC_KEY_PEM,
+      signingKeyId: KEY_ID,
+      trustBundles: [expiredBundle],
+      skipRevocationCheck: true,
+    });
     expect(result.valid).toBe(true);
   });
 });
