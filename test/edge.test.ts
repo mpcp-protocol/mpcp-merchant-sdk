@@ -27,21 +27,23 @@ function makeSba(overrides: {
 } = {}) {
   process.env.MPCP_SBA_SIGNING_PRIVATE_KEY_PEM = PRIVATE_KEY_PEM;
   process.env.MPCP_SBA_SIGNING_KEY_ID = KEY_ID;
-  const sba = createSignedBudgetAuthorization({
-    sessionId: "sess-edge",
-    actorId: "agent-edge",
-    grantId: overrides.grantId ?? "grant-edge-001",
-    policyHash: "hash-edge",
-    currency: overrides.currency ?? "USD",
-    maxAmountMinor: overrides.maxAmountMinor ?? "5000",
-    allowedRails: (overrides.allowedRails ?? ["stripe"]) as any,
-    allowedAssets: [],
-    destinationAllowlist: overrides.destinationAllowlist ?? [],
-    expiresAt: overrides.expiresAt ?? FUTURE,
-  });
-  delete process.env.MPCP_SBA_SIGNING_PRIVATE_KEY_PEM;
-  delete process.env.MPCP_SBA_SIGNING_KEY_ID;
-  return sba;
+  try {
+    return createSignedBudgetAuthorization({
+      sessionId: "sess-edge",
+      actorId: "agent-edge",
+      grantId: overrides.grantId ?? "grant-edge-001",
+      policyHash: "hash-edge",
+      currency: overrides.currency ?? "USD",
+      maxAmountMinor: overrides.maxAmountMinor ?? "5000",
+      allowedRails: (overrides.allowedRails ?? ["stripe"]) as any,
+      allowedAssets: [],
+      destinationAllowlist: overrides.destinationAllowlist ?? [],
+      expiresAt: overrides.expiresAt ?? FUTURE,
+    });
+  } finally {
+    delete process.env.MPCP_SBA_SIGNING_PRIVATE_KEY_PEM;
+    delete process.env.MPCP_SBA_SIGNING_KEY_ID;
+  }
 }
 
 /** Create a Web-compatible Request with the SBA in the Authorization header. */
@@ -251,5 +253,80 @@ describe("verifyMpcpEdge — revocation", () => {
     });
     expect(result.valid).toBe(true);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("revocationEndpoint set without skipRevocationCheck → revocation is checked (default behaviour)", async () => {
+    vi.stubGlobal("fetch", async () => ({
+      ok: true,
+      json: async () => ({ revoked: false }),
+    }));
+
+    const sba = makeSba();
+    // skipRevocationCheck is intentionally absent (defaults to falsy)
+    const result = await verifyMpcpEdge(makeHeaderRequest(sba), {
+      ...baseOpts,
+      revocationEndpoint: "https://example.com/revoke",
+    });
+    expect(result.valid).toBe(true);
+  });
+});
+
+describe("verifyMpcpEdge — edge-case guards", () => {
+  it("oversized Authorization header → falls back to body", async () => {
+    const sba = makeSba();
+    const oversized = "x".repeat(9000); // > MAX_SBA_HEADER_BASE64_CHARS (8192)
+    const req = new Request("https://example.com/charge", {
+      method: "POST",
+      headers: {
+        authorization: `MPCP ${oversized}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ sba }),
+    });
+    const result = await verifyMpcpEdge(req, baseOpts);
+    expect(result.valid).toBe(true);
+  });
+
+  it("malformed expiresAt (not a date) → grant_expired, not silently valid", async () => {
+    // Without the isNaN guard, Date.parse("not-a-date") = NaN and
+    // NaN <= nowMs is false, causing the expiry check to be skipped entirely.
+    const sba = makeSba({ expiresAt: "not-a-date" });
+    const result = await verifyMpcpEdge(makeHeaderRequest(sba), baseOpts);
+    expect(result.valid).toBe(false);
+    if (!result.valid) expect(result.error.code).toBe("grant_expired");
+  });
+
+  it("null-valued field injected into authorization after signing → stripped by canonicalJson → signature still valid", async () => {
+    // Both canonicalJsonEdge (edge) and canonicalJson (mpcp-reference) strip null-valued
+    // object keys. An extra null field injected AFTER signing is stripped before hashing,
+    // so the canonical string matches the original → signature validates.
+    // This test pins that the two implementations have identical null-filtering semantics.
+    const sba = makeSba();
+    const tampered = {
+      ...sba,
+      authorization: { ...(sba as any).authorization, _extraNull: null },
+    };
+    const result = await verifyMpcpEdge(makeHeaderRequest(tampered), baseOpts);
+    expect(result.valid).toBe(true);
+  });
+});
+
+describe("verifyMpcpEdge — hash-chain pin", () => {
+  it("SBA signed by mpcp-reference (sign(null, SHA256(canonical))) verifies correctly via Web Crypto", async () => {
+    // mpcp-reference: h1 = SHA256(canonical); sig = crypto.sign(null, h1, key)
+    // crypto.sign(null, data, ecKey) hashes `data` with SHA-256 internally,
+    // so the actual ECDSA digest is SHA256(h1), NOT h1.
+    //
+    // The edge verifier replicates this by:
+    //   1. Computing h1 = await subtle.digest("SHA-256", msgBytes)
+    //   2. Passing h1 to subtle.verify({ hash: "SHA-256" }, ...) which also computes SHA256(h1)
+    //
+    // Passing rawCanonical bytes directly would make Web Crypto compute SHA256(rawCanonical) = h1,
+    // which does NOT match SHA256(h1), causing all real-SBA verifications to fail.
+    // This test would fail if the hash-chain logic regresses.
+    const sba = makeSba({ grantId: "hash-chain-pin" });
+    const result = await verifyMpcpEdge(makeHeaderRequest(sba), { ...baseOpts, amount: "1" });
+    expect(result.valid).toBe(true);
+    if (result.valid) expect(result.grant.grantId).toBe("hash-chain-pin");
   });
 });

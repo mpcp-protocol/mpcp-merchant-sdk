@@ -72,6 +72,8 @@ describe("withMpcp() Next.js HOC", () => {
 
     expect(handler).toHaveBeenCalledOnce();
     expect((req as any).mpcp).toMatchObject({ valid: true, amount: "1000" });
+    // Verify the extracted SBA object (not raw base64) was passed to verifyMpcp
+    expect(mockVerify).toHaveBeenCalledWith(VALID_SBA_OBJ, expect.objectContaining({ amount: "1000", currency: "USD" }));
   });
 
   it("SBA in req.body.sba → handler called, req.mpcp set", async () => {
@@ -86,6 +88,8 @@ describe("withMpcp() Next.js HOC", () => {
 
     expect(handler).toHaveBeenCalledOnce();
     expect((req as any).mpcp.valid).toBe(true);
+    // Verify the extracted SBA object was passed to verifyMpcp (not undefined or raw body)
+    expect(mockVerify).toHaveBeenCalledWith(VALID_SBA_OBJ, expect.objectContaining({ amount: "1000" }));
   });
 
   it("no SBA provided → 402 with error body, handler NOT called", async () => {

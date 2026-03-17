@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { verifyMpcp } from "../verify.js";
 import { RevocationChecker } from "../revocation.js";
 import { MemorySpendStorage } from "./memory.js";
-import type { MpcpContext, MpcpOptions } from "../types.js";
+import type { MpcpContext, MpcpOptions, VerificationResult } from "../types.js";
 import type { SpendStorage } from "../storage.js";
 
 export type { MpcpContext } from "../types.js";
@@ -145,7 +145,7 @@ export function withMpcp(
     }
 
     // --- Verify ---
-    let result;
+    let result: VerificationResult;
     try {
       result = await verifyMpcp(sba, {
         ...mpcpOptions,

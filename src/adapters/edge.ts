@@ -15,17 +15,36 @@
  *     protocol rules documented in the MPCP spec
  */
 
-import type { BudgetScope, GrantInfo, MpcpContext, MpcpError, VerificationResult } from "../types.js";
+import type { BudgetScope, GrantInfo, MpcpContext, MpcpError, Rail, VerificationResult } from "../types.js";
 
 export type { MpcpContext } from "../types.js";
 
 /** Maximum base64 chars for the Authorization header SBA payload (~6 KB decoded). */
 const MAX_SBA_HEADER_BASE64_CHARS = 8192;
 
+/**
+ * Maximum Content-Length (bytes) allowed for the body-fallback SBA extraction.
+ * The Authorization-header path is bounded by MAX_SBA_HEADER_BASE64_CHARS; the body
+ * fallback is bounded here via the Content-Length header. When Content-Length is absent
+ * (chunked transfer), platform-level limits apply (Cloudflare Workers: 100 MB,
+ * Vercel Edge: configurable).
+ */
+const MAX_BODY_CONTENT_LENGTH = 65_536; // 64 KB
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
+/**
+ * Options for {@link verifyMpcpEdge}.
+ *
+ * Mirrors the relevant subset of {@link MpcpOptions} for the edge runtime.
+ * Revocation caching (`revocationChecker`) and spend tracking (`trackSpend`,
+ * `spendStorage`) are intentionally absent — edge functions are stateless.
+ *
+ * @see {@link MpcpOptions} for the full Node.js option set
+ * @see {@link withMpcp} (Next.js Pages Router), {@link mpcp} (Express), {@link fastifyMpcp} (Fastify)
+ */
 export interface EdgeMpcpOptions {
   /** Requested payment in minor units (e.g. "1500" = $15.00 for USD). */
   amount: string;
@@ -49,7 +68,7 @@ export interface EdgeMpcpOptions {
    * Payment rail to validate against SBA's allowedRails.
    * Omitting this skips rail enforcement.
    */
-  paymentRail?: string;
+  paymentRail?: Rail;
   /** Revocation endpoint URL. GET {endpoint}?grantId={id} → { revoked: boolean }. */
   revocationEndpoint?: string;
   /** Skip revocation check entirely. Default: false. */
@@ -99,7 +118,11 @@ function isSbaEnvelope(value: unknown): value is SbaEnvelope {
     typeof a.currency === "string" &&
     typeof a.maxAmountMinor === "string" &&
     typeof a.expiresAt === "string" &&
+    typeof a.budgetScope === "string" &&
+    typeof a.minorUnit === "number" &&
     Array.isArray(a.allowedRails) &&
+    (a.allowedRails as unknown[]).every((r) => typeof r === "string") &&
+    Array.isArray(a.allowedAssets) &&
     Array.isArray(a.destinationAllowlist)
   );
 }
@@ -169,6 +192,11 @@ function derToP1363(der: Uint8Array, coordSize = 32): Uint8Array | null {
     const sPad = der[offset] === 0x00 ? 1 : 0;
     const sPayload = der.slice(offset + sPad, offset + sLen);
 
+    // Reject oversized coordinates: a crafted DER blob with a malformed length
+    // field could produce rPayload/sPayload longer than coordSize, causing
+    // result.set() to silently write past the intended boundary.
+    if (rPayload.length > coordSize || sPayload.length > coordSize) return null;
+
     // Build P1363: right-align r and s in their respective halves
     const result = new Uint8Array(coordSize * 2);
     result.set(rPayload, coordSize - rPayload.length);
@@ -192,13 +220,17 @@ async function verifyEdgeSignature(sba: SbaEnvelope, keyPem: string): Promise<bo
       false,
       ["verify"],
     );
-    // mpcp-reference signing chain:
-    //   1. h1 = SHA256("MPCP:SBA:1.0:" + canonicalJson(authorization))
-    //   2. sig = crypto.sign(null, h1, privateKey)
-    // crypto.sign(null, data, ecKey) ALWAYS hashes data with SHA-256 internally,
-    // so the actual ECDSA digest is SHA256(h1).
-    // Web Crypto subtle.verify({ hash: "SHA-256" }, key, sig, data) computes SHA256(data)
-    // before verifying. Passing h1 as data makes Web Crypto compute SHA256(h1) = the actual digest.
+    // mpcp-reference signing chain (empirically verified — see test/edge.test.ts):
+    //   1. h1  = SHA256("MPCP:SBA:1.0:" + canonicalJson(authorization))  [hashAuthorization()]
+    //   2. sig = crypto.sign(null, h1, privateKey)                        [sign with null algo]
+    //
+    // Despite receiving a pre-hashed 32-byte buffer, crypto.sign(null, data, ecKey) applies
+    // SHA-256 internally (same as sign("SHA256", data, key)), so the actual ECDSA digest
+    // is SHA256(h1).
+    //
+    // subtle.verify({ hash: "SHA-256" }, key, sig, data) also computes SHA256(data) before
+    // verifying. Passing h1 as `data` makes Web Crypto produce SHA256(h1) = the actual digest.
+    // Passing the raw canonical string would produce SHA256(rawString) = h1 ≠ SHA256(h1).
     const msgBytes = new TextEncoder().encode("MPCP:SBA:1.0:" + canonicalJsonEdge(sba.authorization));
     const h1 = await globalThis.crypto.subtle.digest("SHA-256", msgBytes); // ArrayBuffer
     const derSig = Uint8Array.from(atob(sba.signature), (c) => c.charCodeAt(0));
@@ -225,6 +257,9 @@ async function checkRevocationEdge(endpoint: string, grantId: string): Promise<b
   try {
     const url = `${endpoint}?grantId=${encodeURIComponent(grantId)}`;
     const res = await fetch(url);
+    // Fail-open: both network errors (caught below) and non-OK HTTP responses
+    // (e.g. HTTP 500 from a temporarily unavailable revocation service) are treated
+    // as "not revoked" to avoid blocking legitimate payments during outages.
     if (!res.ok) return false;
     const data = (await res.json()) as { revoked?: boolean };
     return Boolean(data.revoked);
@@ -241,6 +276,10 @@ function invalid(code: MpcpError["code"], detail: string): VerificationResult {
   return { valid: false, error: { code, detail } };
 }
 
+/**
+ * Safe env-var reader for edge runtimes where `process` may not exist
+ * (e.g. Cloudflare Workers). Returns `undefined` for absent or empty values.
+ */
 function getEnvVar(name: string): string | undefined {
   try {
     return (typeof process !== "undefined" && process.env[name]) || undefined;
@@ -309,8 +348,16 @@ export async function verifyMpcpEdge(req: Request, options: EdgeMpcpOptions): Pr
 
   if (sba === undefined) {
     try {
-      const body = (await req.clone().json()) as Record<string, unknown>;
-      if (body && typeof body === "object") sba = body.sba;
+      // Guard: skip body parsing when Content-Length indicates an oversized payload.
+      // If Content-Length is absent (chunked transfer), proceed and rely on platform limits.
+      const cl = req.headers.get("content-length");
+      if (cl === null || parseInt(cl, 10) <= MAX_BODY_CONTENT_LENGTH) {
+        // req.clone() is required: the Web Fetch body stream can only be consumed once.
+        // If the caller has already read the body, the clone will also be empty and
+        // the JSON parse will throw, leaving sba as undefined.
+        const body = (await req.clone().json()) as Record<string, unknown>;
+        if (body && typeof body === "object") sba = body.sba;
+      }
     } catch {
       // no parseable body — sba stays undefined
     }
@@ -331,8 +378,11 @@ export async function verifyMpcpEdge(req: Request, options: EdgeMpcpOptions): Pr
 
   // --- Expiry ---
   const nowMs = options.nowMs ?? Date.now();
-  if (Date.parse(sba.authorization.expiresAt) <= nowMs) {
-    return invalid("grant_expired", "SBA has expired");
+  const expMs = Date.parse(sba.authorization.expiresAt);
+  // Date.parse returns NaN for invalid date strings; NaN <= nowMs is false,
+  // which would silently bypass expiry. Treat NaN as already expired.
+  if (isNaN(expMs) || expMs <= nowMs) {
+    return invalid("grant_expired", "SBA has expired or has an invalid expiresAt");
   }
 
   // --- Currency ---
