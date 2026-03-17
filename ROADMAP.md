@@ -302,7 +302,7 @@ export interface EdgeMpcpOptions {
 #### Tests (`test/trust-bundle.test.ts`)
 
 - `verifyMpcp` with `trustBundles` containing the correct signing key → `valid: true`, no env var set, no network call
-- `verifyMpcp` without `trustBundles` and no env var → `sba_invalid` (confirms no fallback to env when bundles option is used)
+- `verifyMpcp` with no `trustBundles` and no env var → `sba_invalid` (baseline: existing behaviour unchanged)
 - Expired bundle in `trustBundles` → falls through to env var / `sba_invalid` depending on config
 - Edge adapter: `verifyMpcpEdge` with `trustBundles` → `valid: true`
 - Bundle with wrong key embedded → `sba_invalid` (key not found or signature mismatch)
