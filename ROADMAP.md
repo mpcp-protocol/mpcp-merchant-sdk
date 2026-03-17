@@ -269,6 +269,52 @@ Test scenarios:
 
 ---
 
+### PR9 — Trust Bundle support (offline verification)
+
+Enable merchants and embedded verifiers to verify artifact signatures without network access at verification time.
+
+**Depends on:** `mpcp-reference` PR29 (Trust Bundle types + `resolveFromTrustBundle`)
+
+#### Changes to `MpcpOptions` (`src/types.ts`)
+
+```typescript
+export interface MpcpOptions {
+  // ...existing fields...
+  trustBundles?: TrustBundle[];  // pre-loaded bundles; checked before HTTPS well-known
+}
+```
+
+#### Changes to `EdgeMpcpOptions` (`src/adapters/edge.ts`)
+
+```typescript
+export interface EdgeMpcpOptions {
+  // ...existing fields...
+  trustBundles?: TrustBundle[];
+}
+```
+
+#### Implementation
+
+- `verifyMpcp` passes `options.trustBundles` through to the underlying `mpcp-reference` verifiers (`verifySignedBudgetAuthorization`, `verifyPolicyGrant`), which perform step-1 Trust Bundle key lookup before falling back to HTTPS well-known
+- Edge adapter: same option forwarded to Web Crypto verification path; bundles are pure JSON (no Node.js-specific types) so they work in edge runtimes without modification
+- No new runtime dependencies — bundle types come from `mpcp-reference`
+
+#### Tests (`test/trust-bundle.test.ts`)
+
+- `verifyMpcp` with `trustBundles` containing the correct signing key → `valid: true`, no env var set, no network call
+- `verifyMpcp` without `trustBundles` and no env var → `sba_invalid` (confirms no fallback to env when bundles option is used)
+- Expired bundle in `trustBundles` → falls through to env var / `sba_invalid` depending on config
+- Edge adapter: `verifyMpcpEdge` with `trustBundles` → `valid: true`
+- Bundle with wrong key embedded → `sba_invalid` (key not found or signature mismatch)
+
+#### Acceptance criteria
+
+- Merchant can verify a valid SBA with only a pre-loaded Trust Bundle — no `signingKeyPem`, no env var, no network call
+- Edge adapter works identically (Trust Bundle is pure JSON, runtime-agnostic)
+- Expired bundles are not used for key resolution
+
+---
+
 ## Spend storage adapters (future)
 
 The `SpendStorage` interface is intentionally simple. Adapter implementations for production databases are out of scope for this SDK but follow naturally:
