@@ -15,7 +15,7 @@
  *     protocol rules documented in the MPCP spec
  */
 
-import type { BudgetScope, GrantInfo, MpcpContext, MpcpError, Rail, VerificationResult } from "../types.js";
+import type { BudgetScope, GrantInfo, MpcpContext, MpcpError, Rail, TrustBundle, VerificationResult } from "../types.js";
 
 export type { MpcpContext } from "../types.js";
 
@@ -73,6 +73,15 @@ export interface EdgeMpcpOptions {
   revocationEndpoint?: string;
   /** Skip revocation check entirely. Default: false. */
   skipRevocationCheck?: boolean;
+  /**
+   * Pre-loaded Trust Bundles for offline key resolution (PR9).
+   *
+   * When provided, the verifier resolves the SBA signing key from these bundles
+   * (step 1 of the MPCP key resolution algorithm) before falling back to the
+   * `signingKeyPem` / env-var path. Bundles are pure JSON — no Node.js imports.
+   * Supports P-256 (EC) and Ed25519 (OKP) JWKs embedded in the bundle.
+   */
+  trustBundles?: TrustBundle[];
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +109,8 @@ interface SbaEnvelope {
   authorization: SbaAuth;
   issuerKeyId: string;
   signature: string;
+  /** Issuer domain (e.g. "pa.example.com"). Present when created with PR29+ mpcp-reference. */
+  issuer?: string;
 }
 
 function isSbaEnvelope(value: unknown): value is SbaEnvelope {
@@ -208,6 +219,40 @@ function derToP1363(der: Uint8Array, coordSize = 32): Uint8Array | null {
 }
 
 // ---------------------------------------------------------------------------
+// Trust Bundle key resolution (pure JS — no crypto, works in all runtimes)
+// ---------------------------------------------------------------------------
+
+/** JWK shape used for Trust Bundle key resolution and Web Crypto importKey. */
+type BundleJwk = JsonWebKey & { kid?: string };
+
+/**
+ * Resolve the signing key for `issuer` / `keyId` from the given Trust Bundles.
+ * Bundles are sorted by expiry (latest first); expired bundles are skipped.
+ * Returns the first matching JWK, or null if none found.
+ */
+function resolveKeyFromBundles(
+  issuer: string,
+  keyId: string | undefined,
+  bundles: TrustBundle[],
+): BundleJwk | null {
+  const now = Date.now();
+  const sorted = [...bundles].sort(
+    (a, b) => Date.parse(b.expiresAt) - Date.parse(a.expiresAt),
+  );
+  for (const bundle of sorted) {
+    if (Date.parse(bundle.expiresAt) <= now) continue;
+    if (!bundle.approvedIssuers.includes(issuer)) continue;
+    const entry = bundle.issuers.find((e) => e.issuer === issuer);
+    if (!entry) continue;
+    const key = keyId
+      ? entry.keys.find((k) => k.kid === keyId)
+      : entry.keys[0];
+    if (key) return key as unknown as BundleJwk;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Signature verification via Web Crypto
 // ---------------------------------------------------------------------------
 
@@ -244,6 +289,65 @@ async function verifyEdgeSignature(sba: SbaEnvelope, keyPem: string): Promise<bo
       sigBuf,
       h1,
     );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify an SBA signature against a JWK from a Trust Bundle.
+ *
+ * Supports:
+ *   - EC P-256  (kty:"EC",  crv:"P-256")  — DER→P1363 conversion required
+ *   - OKP Ed25519 (kty:"OKP", crv:"Ed25519") — raw 64-byte signature, no conversion
+ *
+ * Both algorithm paths compute h1 = SHA-256("MPCP:SBA:1.0:" + canonicalJson(auth))
+ * then verify using the same double-hash chain as verifyEdgeSignature (see its
+ * comment for the rationale).
+ */
+async function verifyEdgeSignatureFromJwk(sba: SbaEnvelope, jwk: BundleJwk): Promise<boolean> {
+  try {
+    const msgBytes = new TextEncoder().encode("MPCP:SBA:1.0:" + canonicalJsonEdge(sba.authorization));
+    const h1 = await globalThis.crypto.subtle.digest("SHA-256", msgBytes); // ArrayBuffer
+
+    if (jwk.kty === "EC" && jwk.crv === "P-256") {
+      const publicKey = await globalThis.crypto.subtle.importKey(
+        "jwk",
+        jwk as JsonWebKey,
+        { name: "ECDSA", namedCurve: "P-256" },
+        false,
+        ["verify"],
+      );
+      const derSig = Uint8Array.from(atob(sba.signature), (c) => c.charCodeAt(0));
+      const p1363 = derToP1363(derSig);
+      if (!p1363) return false;
+      const sigBuf = p1363.buffer.slice(p1363.byteOffset, p1363.byteOffset + p1363.byteLength) as ArrayBuffer;
+      return await globalThis.crypto.subtle.verify(
+        { name: "ECDSA", hash: { name: "SHA-256" } },
+        publicKey,
+        sigBuf,
+        h1,
+      );
+    }
+
+    if (jwk.kty === "OKP" && jwk.crv === "Ed25519") {
+      // Ed25519: crypto.sign(null, h1, edKey) in Node.js signs h1 directly with Ed25519
+      // (no additional SHA-256 hashing by Node.js for Ed25519; the algorithm uses its own
+      // internal hash). subtle.verify({ name: "Ed25519" }, key, sig, h1) verifies h1 directly.
+      // Signature is raw 64 bytes — no DER conversion required.
+      const publicKey = await globalThis.crypto.subtle.importKey(
+        "jwk",
+        jwk as JsonWebKey,
+        { name: "Ed25519" },
+        false,
+        ["verify"],
+      );
+      const rawSig = Uint8Array.from(atob(sba.signature), (c) => c.charCodeAt(0));
+      const sigBuf = rawSig.buffer.slice(rawSig.byteOffset, rawSig.byteOffset + rawSig.byteLength) as ArrayBuffer;
+      return await globalThis.crypto.subtle.verify({ name: "Ed25519" }, publicKey, sigBuf, h1);
+    }
+
+    return false; // unsupported key type
   } catch {
     return false;
   }
@@ -326,9 +430,13 @@ function getEnvVar(name: string): string | undefined {
 export async function verifyMpcpEdge(req: Request, options: EdgeMpcpOptions): Promise<VerificationResult> {
   const keyPem = options.signingKeyPem ?? getEnvVar("MPCP_SBA_SIGNING_PUBLIC_KEY_PEM");
   const keyId = options.signingKeyId ?? getEnvVar("MPCP_SBA_SIGNING_KEY_ID");
+  const hasBundles = (options.trustBundles?.length ?? 0) > 0;
 
-  if (!keyPem) {
-    return invalid("sba_invalid", "No signing key configured (signingKeyPem or MPCP_SBA_SIGNING_PUBLIC_KEY_PEM)");
+  if (!keyPem && !hasBundles) {
+    return invalid(
+      "sba_invalid",
+      "No signing key configured (signingKeyPem, MPCP_SBA_SIGNING_PUBLIC_KEY_PEM, or trustBundles)",
+    );
   }
 
   // --- Extract SBA ---
@@ -367,14 +475,31 @@ export async function verifyMpcpEdge(req: Request, options: EdgeMpcpOptions): Pr
     return invalid("sba_invalid", "Invalid or missing SignedBudgetAuthorization");
   }
 
-  // --- Key ID check ---
-  if (keyId && sba.issuerKeyId !== keyId) {
-    return invalid("sba_invalid", "Signing key ID mismatch");
+  // --- Trust Bundle key resolution (step 1 — checked before PEM/env-var key) ---
+  // Mirrors the 3-step key resolution order in mpcp-reference PR29.
+  let usedBundle = false;
+  if (hasBundles && sba.issuer) {
+    const jwk = resolveKeyFromBundles(sba.issuer, sba.issuerKeyId, options.trustBundles!);
+    if (jwk) {
+      const signatureOk = await verifyEdgeSignatureFromJwk(sba, jwk);
+      if (!signatureOk) return invalid("sba_invalid", "Invalid SBA signature");
+      usedBundle = true;
+    }
   }
 
-  // --- Signature verification ---
-  const signatureOk = await verifyEdgeSignature(sba, keyPem);
-  if (!signatureOk) return invalid("sba_invalid", "Invalid SBA signature");
+  if (!usedBundle) {
+    // --- PEM/env-var key path (step 2 fallback) ---
+    if (!keyPem) {
+      return invalid("sba_invalid", "No signing key configured (signingKeyPem or MPCP_SBA_SIGNING_PUBLIC_KEY_PEM)");
+    }
+    // --- Key ID check ---
+    if (keyId && sba.issuerKeyId !== keyId) {
+      return invalid("sba_invalid", "Signing key ID mismatch");
+    }
+    // --- Signature verification ---
+    const signatureOk = await verifyEdgeSignature(sba, keyPem);
+    if (!signatureOk) return invalid("sba_invalid", "Invalid SBA signature");
+  }
 
   // --- Expiry ---
   const nowMs = options.nowMs ?? Date.now();

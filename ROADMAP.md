@@ -302,10 +302,6 @@ export interface MpcpOptions {
 - Merchant can verify a valid SBA with only a pre-loaded Trust Bundle — no `signingKeyPem`, no env var, no network call
 - Expired bundles are not used for key resolution
 
-#### Deferred
-
-- Edge adapter (`src/adapters/edge.ts`) `trustBundles` support — depends on PR6 (Edge adapter not yet implemented)
-
 ---
 
 ## Spend storage adapters (future)
