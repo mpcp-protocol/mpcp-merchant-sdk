@@ -125,7 +125,7 @@ export async function verifyMpcp(
   const decision = syntheticDecision(sba, options.amount, options.paymentRail);
   const result = runVerifySync(
     sba,
-    { sessionId: auth.sessionId, decision, nowMs: options.nowMs, cumulativeSpentMinor },
+    { sessionId: auth.sessionId, decision, nowMs: options.nowMs, cumulativeSpentMinor, trustBundles: options.trustBundles },
     options.signingKeyPem,
     options.signingKeyId,
   );

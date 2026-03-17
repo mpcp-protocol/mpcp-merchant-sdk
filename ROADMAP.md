@@ -269,7 +269,7 @@ Test scenarios:
 
 ---
 
-### PR9 — Trust Bundle support (offline verification)
+### PR9 — Trust Bundle support (offline verification) ✓
 
 Enable merchants and embedded verifiers to verify artifact signatures without network access at verification time.
 

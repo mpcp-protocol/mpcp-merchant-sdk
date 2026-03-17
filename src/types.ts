@@ -1,8 +1,8 @@
-import type { Rail } from "mpcp-service/sdk";
+import type { Rail, TrustBundle } from "mpcp-service/sdk";
 import type { RevocationChecker } from "./revocation.js";
 import type { SpendStorage } from "./storage.js";
 
-export type { Rail } from "mpcp-service/sdk";
+export type { Rail, TrustBundle } from "mpcp-service/sdk";
 export type { RevocationChecker } from "./revocation.js";
 export type { SpendStorage, SpendEntry } from "./storage.js";
 
@@ -90,4 +90,14 @@ export interface MpcpOptions {
   spendStorage?: SpendStorage;
   /** Idempotency key for deduplication. Same key is never counted twice. */
   idempotencyKey?: string;
+
+  // PR9 — trust bundles
+  /**
+   * Pre-loaded Trust Bundles for offline key resolution.
+   *
+   * When provided, the verifier checks these bundles (step 1 of the MPCP key
+   * resolution algorithm) before falling back to the env-var signing key. Bundles
+   * are pure JSON and work in all runtimes including Edge.
+   */
+  trustBundles?: TrustBundle[];
 }
